@@ -1,0 +1,130 @@
+name: Build #3289 commit object
+
+on:
+  push:
+    branches:
+      - work/prepare-3289-v8
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: ci/share-go-setup-3289
+          fetch-depth: 0
+
+      - name: Apply scoped CI refactor from generator
+        shell: bash
+        run: |
+          python <<'PY'
+          from __future__ import annotations
+          import subprocess
+          import textwrap
+
+          source = subprocess.check_output(
+              [
+                  "git",
+                  "show",
+                  "origin/work/prepare-3289-v6:.github/workflows/prepare-3289.yml",
+              ],
+              text=True,
+          )
+          marker = "          python <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY\n", start)
+          script = textwrap.dedent(source[start:end])
+          exec(compile(script, "prepare-3289-generator", "exec"))
+          PY
+
+      - name: Validate focused contract
+        shell: bash
+        run: |
+          python tools/ci/tests/test_shared_go_ci.py
+          git diff --check
+
+      - name: Create detached Git commit object
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python <<'PY'
+          from __future__ import annotations
+          import base64
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          api = f"https://api.github.com/repos/{repo}"
+
+          def request(method: str, path: str, payload: dict) -> dict:
+              data = json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  api + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(req) as resp:
+                  return json.load(resp)
+
+          changed = subprocess.check_output(
+              ["bash", "-lc", "{ git diff --name-only; git ls-files --others --exclude-standard; } | sort -u"],
+              text=True,
+          ).splitlines()
+          base_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          base_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+
+          entries = []
+          for path in changed:
+              raw = open(path, "rb").read()
+              blob = request(
+                  "POST",
+                  "/git/blobs",
+                  {"content": base64.b64encode(raw).decode(), "encoding": "base64"},
+              )
+              entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+          tree = request("POST", "/git/trees", {"base_tree": base_tree, "tree": entries})
+          identity = {
+              "name": "Yiğitcan Öztürk",
+              "email": "318303091+yigitcan-ozturk@users.noreply.github.com",
+          }
+          message = (
+              "[CI/Build] share Go setup across PR jobs\n\n"
+              "Signed-off-by: Yiğitcan Öztürk <318303091+yigitcan-ozturk@users.noreply.github.com>"
+          )
+          commit = request(
+              "POST",
+              "/git/commits",
+              {
+                  "message": message,
+                  "tree": tree["sha"],
+                  "parents": [base_commit],
+                  "author": identity,
+                  "committer": identity,
+              },
+          )
+          print(commit["sha"])
+          with open("/tmp/3289-commit-sha.txt", "w", encoding="utf-8") as f:
+              f.write(commit["sha"] + "\n")
+          PY
+
+      - name: Upload commit SHA
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-router-3289-commit-sha
+          path: /tmp/3289-commit-sha.txt
+          retention-days: 1
