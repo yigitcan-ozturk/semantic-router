@@ -1,0 +1,295 @@
+name: Prepare #3289 implementation
+
+on:
+  push:
+    branches:
+      - work/prepare-3289-v6
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: ci/share-go-setup-3289
+          fetch-depth: 0
+
+      - name: Apply scoped CI refactor
+        shell: bash
+        run: |
+          python <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          TARGETS = {
+              ".github/workflows/pre-commit.yml": {},
+              ".github/workflows/test-and-build.yml": {},
+              ".github/workflows/dashboard-test.yml": {
+                  "cache-dependency-path": "dashboard/backend/go.sum",
+              },
+              ".github/workflows/operator-ci.yml": {
+                  "cache-dependency-path": "deploy/operator/go.sum",
+                  "working-directory": "deploy/operator",
+              },
+              ".github/workflows/recipe-conformance.yml": {},
+              ".github/workflows/openvino-binding-ci.yml": {
+                  "cache-dependency-path": "openvino-binding/go.sum",
+              },
+              ".github/workflows/integration-test-k8s.yml": {},
+              ".github/workflows/performance-test.yml": {},
+          }
+
+          def leading_spaces(line: str) -> int:
+              return len(line) - len(line.lstrip(" "))
+
+          def remove_named_steps(path: Path, names: set[str]) -> None:
+              lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+              out: list[str] = []
+              i = 0
+              removed: set[str] = set()
+              while i < len(lines):
+                  stripped = lines[i].strip()
+                  matched = None
+                  for name in names:
+                      if stripped == f"- name: {name}":
+                          matched = name
+                          break
+                  if matched is None:
+                      out.append(lines[i])
+                      i += 1
+                      continue
+
+                  removed.add(matched)
+                  indent = leading_spaces(lines[i])
+                  i += 1
+                  while i < len(lines):
+                      if not lines[i].strip():
+                          i += 1
+                          break
+                      if leading_spaces(lines[i]) <= indent and lines[i].lstrip().startswith("- "):
+                          break
+                      i += 1
+
+              missing = names - removed
+              if missing:
+                  raise SystemExit(f"{path}: expected steps not found: {sorted(missing)}")
+              path.write_text("".join(out), encoding="utf-8")
+
+          def replace_setup_steps(path: Path, options: dict[str, str]) -> None:
+              lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+              out: list[str] = []
+              i = 0
+              replacements = 0
+              while i < len(lines):
+                  stripped = lines[i].strip()
+                  named = stripped == "- name: Set up Go"
+                  bare = stripped == "- uses: actions/setup-go@v5"
+                  if not named and not bare:
+                      out.append(lines[i])
+                      i += 1
+                      continue
+
+                  indent = leading_spaces(lines[i])
+                  if named:
+                      if i + 1 >= len(lines) or lines[i + 1].strip() != "uses: actions/setup-go@v5":
+                          out.append(lines[i])
+                          i += 1
+                          continue
+                      i += 2
+                  else:
+                      i += 1
+
+                  if i < len(lines) and lines[i].strip() == "with:":
+                      i += 1
+                      while i < len(lines):
+                          if not lines[i].strip():
+                              break
+                          if leading_spaces(lines[i]) <= indent:
+                              break
+                          i += 1
+
+                  download_modules = False
+                  look = i
+                  while look < len(lines) and not lines[look].strip():
+                      look += 1
+                  if path.name == "operator-ci.yml" and look < len(lines):
+                      if lines[look].strip() == "- name: Download dependencies":
+                          download_modules = True
+                          step_indent = leading_spaces(lines[look])
+                          look += 1
+                          while look < len(lines):
+                              if not lines[look].strip():
+                                  look += 1
+                                  break
+                              if leading_spaces(lines[look]) <= step_indent and lines[look].lstrip().startswith("- "):
+                                  break
+                              look += 1
+                          i = look
+
+                  out.append(" " * indent + "- name: Set up Go\n")
+                  out.append(" " * (indent + 2) + "uses: ./.github/actions/setup-go-ci\n")
+                  action_options = dict(options)
+                  if download_modules:
+                      action_options["download-modules"] = '"true"'
+                  if action_options:
+                      out.append(" " * (indent + 2) + "with:\n")
+                      for key, value in action_options.items():
+                          out.append(" " * (indent + 4) + f"{key}: {value}\n")
+                  replacements += 1
+
+              if replacements == 0:
+                  raise SystemExit(f"{path}: no setup-go steps replaced")
+              path.write_text("".join(out), encoding="utf-8")
+
+          action = Path(".github/actions/setup-go-ci/action.yml")
+          action.parent.mkdir(parents=True, exist_ok=True)
+          action.write_text(
+              """name: Set up Go for CI
+          description: Install the repository Go toolchain and restore the shared module/build cache.
+
+          inputs:
+            working-directory:
+              description: Directory used when downloading Go modules.
+              required: false
+              default: .
+            cache-dependency-path:
+              description: go.sum path or glob used to key the shared Go cache.
+              required: false
+              default: '**/go.sum'
+            download-modules:
+              description: Download modules after configuring the toolchain.
+              required: false
+              default: 'false'
+
+          runs:
+            using: composite
+            steps:
+              - name: Install Go 1.25
+                uses: actions/setup-go@v5
+                with:
+                  go-version: '1.25'
+                  cache: true
+                  cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+              - name: Download Go modules
+                if: ${{ inputs.download-modules == 'true' }}
+                shell: bash
+                working-directory: ${{ inputs.working-directory }}
+                run: go mod download
+          """,
+              encoding="utf-8",
+          )
+
+          for filename, options in TARGETS.items():
+              replace_setup_steps(Path(filename), options)
+
+          for filename in (
+              ".github/workflows/pre-commit.yml",
+              ".github/workflows/test-and-build.yml",
+              ".github/workflows/dashboard-test.yml",
+              ".github/workflows/performance-test.yml",
+          ):
+              remove_named_steps(Path(filename), {"Cache Go dependencies"})
+
+          remove_named_steps(
+              Path(".github/workflows/test-and-build.yml"),
+              {"Set up golangci-lint", "Check go mod tidy"},
+          )
+
+          operator = Path(".github/workflows/operator-ci.yml")
+          operator_text = operator.read_text(encoding="utf-8")
+          operator_text = operator_text.replace("  GO_VERSION: '1.25'\n", "")
+          if "actions/setup-go@v5" in operator_text or "run: go mod download" in operator_text:
+              raise SystemExit("operator-ci.yml still contains duplicated Go bootstrap")
+          operator.write_text(operator_text, encoding="utf-8")
+
+          test_path = Path("tools/ci/tests/test_shared_go_ci.py")
+          test_path.write_text(
+              """from __future__ import annotations
+
+          import unittest
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[3]
+          PR_GO_WORKFLOWS = (
+              '.github/workflows/pre-commit.yml',
+              '.github/workflows/test-and-build.yml',
+              '.github/workflows/dashboard-test.yml',
+              '.github/workflows/operator-ci.yml',
+              '.github/workflows/recipe-conformance.yml',
+              '.github/workflows/openvino-binding-ci.yml',
+              '.github/workflows/integration-test-k8s.yml',
+              '.github/workflows/performance-test.yml',
+          )
+
+
+          class SharedGoCiTests(unittest.TestCase):
+              def test_composite_pins_toolchain_and_cache(self) -> None:
+                  text = (REPO_ROOT / '.github/actions/setup-go-ci/action.yml').read_text(encoding='utf-8')
+                  self.assertIn('uses: actions/setup-go@v5', text)
+                  self.assertIn("go-version: '1.25'", text)
+                  self.assertIn('cache: true', text)
+                  self.assertIn('cache-dependency-path:', text)
+
+              def test_pr_go_workflows_use_composite(self) -> None:
+                  for relative in PR_GO_WORKFLOWS:
+                      with self.subTest(workflow=relative):
+                          text = (REPO_ROOT / relative).read_text(encoding='utf-8')
+                          self.assertNotIn('uses: actions/setup-go@v5', text)
+                          self.assertIn('uses: ./.github/actions/setup-go-ci', text)
+
+              def test_operator_downloads_modules_through_composite(self) -> None:
+                  text = (REPO_ROOT / '.github/workflows/operator-ci.yml').read_text(encoding='utf-8')
+                  self.assertNotIn('run: go mod download', text)
+                  self.assertGreaterEqual(text.count('download-modules: "true"'), 3)
+
+              def test_core_drops_duplicate_receipts(self) -> None:
+                  text = (REPO_ROOT / '.github/workflows/test-and-build.yml').read_text(encoding='utf-8')
+                  self.assertNotIn('golangci/golangci-lint-action', text)
+                  self.assertNotIn('run: make check-go-mod-tidy', text)
+
+
+          if __name__ == '__main__':
+              unittest.main()
+          """,
+              encoding="utf-8",
+          )
+
+          for relative in TARGETS:
+              text = Path(relative).read_text(encoding="utf-8")
+              if "actions/setup-go@v5" in text:
+                  raise SystemExit(f"{relative}: direct setup-go remains")
+
+          core_text = Path(".github/workflows/test-and-build.yml").read_text(encoding="utf-8")
+          if "golangci/golangci-lint-action" in core_text or "make check-go-mod-tidy" in core_text:
+              raise SystemExit("test-and-build.yml still contains duplicate Core receipts")
+          PY
+
+      - name: Validate focused contract
+        shell: bash
+        run: |
+          python tools/ci/tests/test_shared_go_ci.py
+          git diff --check
+
+      - name: Commit contribution changes
+        shell: bash
+        run: |
+          git config user.name "yigitcan-ozturk"
+          git config user.email "318303091+yigitcan-ozturk@users.noreply.github.com"
+          git add .github/actions/setup-go-ci/action.yml \
+            .github/workflows/pre-commit.yml \
+            .github/workflows/test-and-build.yml \
+            .github/workflows/dashboard-test.yml \
+            .github/workflows/operator-ci.yml \
+            .github/workflows/recipe-conformance.yml \
+            .github/workflows/openvino-binding-ci.yml \
+            .github/workflows/integration-test-k8s.yml \
+            .github/workflows/performance-test.yml \
+            tools/ci/tests/test_shared_go_ci.py
+          git commit -s -m "[CI/Build] share Go setup across PR jobs"
+          git push origin HEAD:ci/share-go-setup-3289
