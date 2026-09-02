@@ -1,0 +1,66 @@
+name: Prepare #3289 artifact
+
+on:
+  push:
+    branches:
+      - work/prepare-3289-v7-trigger
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: ci/share-go-setup-3289
+          fetch-depth: 0
+
+      - name: Apply scoped CI refactor from generator
+        shell: bash
+        run: |
+          python <<'PY'
+          from __future__ import annotations
+          import subprocess
+          import textwrap
+
+          source = subprocess.check_output(
+              [
+                  "git",
+                  "show",
+                  "origin/work/prepare-3289-v6:.github/workflows/prepare-3289.yml",
+              ],
+              text=True,
+          )
+          marker = "          python <<'PY'\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n          PY\n", start)
+          script = textwrap.dedent(source[start:end])
+          exec(compile(script, "prepare-3289-generator", "exec"))
+          PY
+
+      - name: Validate focused contract
+        shell: bash
+        run: |
+          python tools/ci/tests/test_shared_go_ci.py
+          git diff --check
+
+      - name: Package generated changes
+        shell: bash
+        run: |
+          mkdir -p /tmp/3289
+          {
+            git diff --name-only
+            git ls-files --others --exclude-standard
+          } | sort -u > /tmp/3289/changed-files.txt
+          tar -czf /tmp/3289/changes.tgz -T /tmp/3289/changed-files.txt
+          git diff --binary > /tmp/3289/changes.patch
+
+      - name: Upload generated changes
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-router-3289-generated
+          path: /tmp/3289/
+          retention-days: 1
